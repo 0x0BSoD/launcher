@@ -1,0 +1,11 @@
+roundEdges: true
+
+# Catppuccin Mocha (dark appearance)
+dark.background: #1e1e2e
+dark.foreground: #cdd6f4
+dark.accent: #89b4fa
+
+# Catppuccin Latte (light appearance)
+light.background: #eff1f5
+light.foreground: #4c4f69
+light.accent: #1e66f5

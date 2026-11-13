@@ -1,0 +1,15 @@
+[package]
+name = "launcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = { version = "0.14", features = ["image-without-codecs"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+fuzzy-matcher = "0.3"
+window-vibrancy = "0.8.1"
+objc2 = "0.6"
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
