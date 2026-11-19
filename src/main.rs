@@ -5,7 +5,11 @@ use iced::{
     Border, Color, Element, Fill, Task, Theme, keyboard,
     widget::{button, column, container, image, operation, row, text, text_input},
 };
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::PathBuf,
+    process::Command,
+    time::{Duration, Instant},
+};
 use window_vibrancy::{
     LiquidGlassOptions, NSGlassEffectViewStyle, NSVisualEffectMaterial, NSVisualEffectState,
 };
@@ -23,8 +27,13 @@ fn main() -> iced::Result {
         .window_size((680.0, 560.0))
         .resizable(false)
         .centered()
-        .subscription(|_| {
+        .subscription(|state| {
             iced::Subscription::batch([
+                if state.animating() {
+                    iced::window::frames().map(Message::Tick)
+                } else {
+                    iced::Subscription::none()
+                },
                 iced::system::theme_changes().map(Message::Appearance),
                 iced::event::listen_with(|event, status, _| match event {
                     iced::Event::Keyboard(event) if forward_key(&event, status) => {
@@ -45,6 +54,7 @@ enum Message {
     Icons(Vec<Option<image::Handle>>),
     Key(keyboard::Event),
     Launch(usize),
+    Tick(Instant),
 }
 
 fn forward_key(event: &keyboard::Event, status: iced::event::Status) -> bool {
@@ -73,6 +83,8 @@ fn apply_glass(window: &dyn iced::window::Window, radius: f64) -> bool {
     unsafe {
         let ns_window: *mut objc2::runtime::AnyObject = objc2::msg_send![view, window];
         let _: () = objc2::msg_send![ns_window, setHasShadow: false];
+        // Hidden until the fade-in starts, so the window never flashes opaque.
+        let _: () = objc2::msg_send![ns_window, setAlphaValue: 0.0_f64];
     }
     let frame: *mut objc2::runtime::AnyObject = unsafe { objc2::msg_send![view, superview] };
     let Some(frame) = std::ptr::NonNull::new(frame) else {
@@ -99,6 +111,21 @@ fn apply_glass(window: &dyn iced::window::Window, radius: f64) -> bool {
     .is_ok()
 }
 
+fn set_alpha(window: &dyn iced::window::Window, alpha: f64) {
+    use raw_window_handle::RawWindowHandle;
+    if let Ok(RawWindowHandle::AppKit(handle)) =
+        window.window_handle().map(|handle| handle.as_raw())
+    {
+        unsafe {
+            let view = handle.ns_view.cast::<objc2::runtime::AnyObject>().as_ref();
+            let ns_window: *mut objc2::runtime::AnyObject = objc2::msg_send![view, window];
+            let _: () = objc2::msg_send![ns_window, setAlphaValue: alpha];
+        }
+    }
+}
+
+const SELECT_FADE: Duration = Duration::from_millis(150);
+
 fn dim(color: Color, alpha: f32) -> Color {
     Color { a: alpha, ..color }
 }
@@ -113,6 +140,10 @@ struct Launcher {
     query: String,
     selected: usize,
     error: Option<String>,
+    fade: iced::animation::Animation<bool>,
+    closing: bool,
+    now: Instant,
+    selected_at: Instant,
 }
 
 impl Launcher {
@@ -162,6 +193,10 @@ impl Launcher {
                 selected: 0,
                 error: (!errors.is_empty())
                     .then(|| "Some folders could not be read; see terminal output.".into()),
+                fade: iced::animation::Animation::new(false).quick(),
+                closing: false,
+                now: Instant::now(),
+                selected_at: Instant::now(),
             },
             Task::batch([
                 operation::focus("search"),
@@ -172,10 +207,44 @@ impl Launcher {
         )
     }
 
+    fn animating(&self) -> bool {
+        self.fade.is_animating(self.now) || self.now < self.selected_at + SELECT_FADE
+    }
+
+    fn select(&mut self, index: usize) {
+        if index != self.selected {
+            self.selected = index;
+            self.selected_at = Instant::now();
+            self.now = self.selected_at;
+        }
+    }
+
+    fn close(&mut self) -> Task<Message> {
+        if !self.closing {
+            self.closing = true;
+            self.now = Instant::now();
+            self.fade.go_mut(false, self.now);
+        }
+        Task::none()
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Appearance(mode) => self.appearance = mode,
-            Message::Glass(glass) => self.glass = glass,
+            Message::Glass(glass) => {
+                self.glass = glass;
+                self.fade.go_mut(true, Instant::now());
+            }
+            Message::Tick(now) => {
+                self.now = now;
+                if self.closing && !self.fade.is_animating(now) {
+                    return iced::exit();
+                }
+                let alpha = self.fade.interpolate(0.0, 1.0, now) as f64;
+                return iced::window::oldest()
+                    .and_then(move |id| iced::window::run(id, move |w| set_alpha(w, alpha)))
+                    .discard();
+            }
             Message::Icons(icons) => self.icons = icons,
             Message::Query(query) => {
                 self.query = query;
@@ -183,12 +252,12 @@ impl Launcher {
                 self.selected = 0;
             }
             Message::Key(keyboard::Event::KeyPressed { key, .. }) => match key.as_ref() {
-                keyboard::Key::Named(keyboard::key::Named::Escape) => return iced::exit(),
+                keyboard::Key::Named(keyboard::key::Named::Escape) => return self.close(),
                 keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                    self.selected = (self.selected + 1).min(self.matches.len().saturating_sub(1));
+                    self.select((self.selected + 1).min(self.matches.len().saturating_sub(1)));
                 }
                 keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                    self.selected = self.selected.saturating_sub(1);
+                    self.select(self.selected.saturating_sub(1));
                 }
                 keyboard::Key::Named(keyboard::key::Named::Enter) => {
                     if let Some(&index) = self.matches.get(self.selected) {
@@ -200,7 +269,7 @@ impl Launcher {
             Message::Launch(index) => {
                 if let Some(app) = self.apps.get(index) {
                     match Command::new("/usr/bin/open").arg(&app.path).output() {
-                        Ok(output) if output.status.success() => return iced::exit(),
+                        Ok(output) if output.status.success() => return self.close(),
                         Ok(output) => {
                             self.error = Some(format!(
                                 "Could not open {}: {}",
@@ -286,7 +355,16 @@ impl Launcher {
                 .style(move |theme: &Theme, status| {
                     let palette = theme.palette();
                     let (background, border) = if position == self.selected {
-                        (dim(palette.primary, 0.28), dim(palette.primary, 0.55))
+                        let t = (self
+                            .now
+                            .saturating_duration_since(self.selected_at)
+                            .as_secs_f32()
+                            / SELECT_FADE.as_secs_f32())
+                        .min(1.0);
+                        (
+                            dim(palette.primary, 0.28 * t),
+                            dim(palette.primary, 0.55 * t),
+                        )
                     } else if status == button::Status::Hovered {
                         (dim(palette.text, 0.06), Color::TRANSPARENT)
                     } else {
